@@ -1,271 +1,543 @@
-import React, { useEffect, useRef, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:7070'
+const STORAGE_KEY = 'listener-ai-sessions'
+const STOPWORDS = new Set([
+  'the','and','you','that','for','with','have','this','from','they','will','your','about','there','would','could','should','into','what','when','where','which','been','were','them','their','over','also','just','like','need','more','some','than','each','make','keep','take','very','much','onto','ourselves','ours','ourselves','hers','herself','himself','hers','does','done','doing'
+])
 
-export default function App() {
-  // Server + corpus/index config
-  const [server, setServer] = useState(API_BASE)
-  const [corpus, setCorpus] = useState('./my_corpus')
-  const [indexPath, setIndexPath] = useState('./.index')
+function analyzeTranscript(text) {
+  const clean = text.trim()
+  if (!clean) {
+    return {
+      summary: '',
+      tasks: [],
+      tags: [],
+      entities: [],
+      wordCount: 0,
+    }
+  }
 
-  // Index params
-  const [chunk, setChunk] = useState(1200)
-  const [overlap, setOverlap] = useState(150)
+  const sentences = clean
+    .replace(/\s+/g, ' ')
+    .split(/(?<=[.!?])\s+/)
+    .filter(Boolean)
+  const summary = sentences.slice(0, 3).join(' ')
 
-  // Ask panel
-  const [question, setQuestion] = useState('Tell me about the event automation?')
-  const [k, setK] = useState(8)
-  const [model, setModel] = useState('gpt-4o-mini')
-  const [answer, setAnswer] = useState('')
-  const [hits, setHits] = useState([])
-  const [showSnippets, setShowSnippets] = useState(false)
+  const taskRegex = /(action item|follow up|todo|to-do|should|need to|let's|please|remember to|deadline|schedule|assign|plan to|we must)/i
+  const tasks = sentences
+    .map((sentence, index) => ({ sentence, index }))
+    .filter(({ sentence }) => taskRegex.test(sentence))
+    .map(({ sentence, index }) => ({
+      id: `${index}-${Math.random().toString(36).slice(2, 7)}`,
+      text: sentence.trim(),
+      done: false,
+    }))
 
-  // Tasks panel
-  const [tasks, setTasks] = useState([])
-  const [newTitle, setNewTitle] = useState('')
-  const [newPriority, setNewPriority] = useState('High')
-  const [newDue, setNewDue] = useState('')
+  const words = clean
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean)
 
-  // File upload / voice record
-  const [uploading, setUploading] = useState(false)
-  const [loading, setLoading] = useState(false)
-  const [log, setLog] = useState('')
-  const mediaRecorderRef = useRef(null)
+  const counts = new Map()
+  for (const word of words) {
+    if (word.length < 4 || STOPWORDS.has(word)) continue
+    counts.set(word, (counts.get(word) || 0) + 1)
+  }
+
+  const tags = Array.from(counts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 6)
+    .map(([word]) => word)
+
+  const entities = Array.from(
+    new Set(
+      clean
+        .split(/\s+/)
+        .filter((token) => /^[A-Z][a-zA-Z]{2,}$/.test(token) && !STOPWORDS.has(token.toLowerCase()))
+    )
+  ).slice(0, 8)
+
+  return {
+    summary,
+    tasks,
+    tags,
+    entities,
+    wordCount: words.length,
+  }
+}
+
+function formatDuration(ms) {
+  if (!ms || Number.isNaN(ms)) return '—'
+  const totalSeconds = Math.round(ms / 1000)
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  if (minutes === 0) return `${seconds}s`
+  return `${minutes}m ${seconds.toString().padStart(2, '0')}s`
+}
+
+function App() {
+  const [sessions, setSessions] = useState([])
+  const [selectedId, setSelectedId] = useState(null)
+  const [search, setSearch] = useState('')
+  const [currentTranscript, setCurrentTranscript] = useState('')
+  const [noteTitle, setNoteTitle] = useState('Untitled Session')
+  const [status, setStatus] = useState('Ready to capture ideas.')
   const [isRecording, setIsRecording] = useState(false)
-  const chunksRef = useRef([])
+  const [speechSupported, setSpeechSupported] = useState(true)
+  const [lastDurationMs, setLastDurationMs] = useState(null)
 
-  // --- helpers ---
-  async function call(path, body, init={}) {
-    try {
-      const res = await fetch(`${server}${path}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-        ...init
-      })
-      if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`)
-      return await res.json()
-    } catch (e) {
-      throw new Error(`Request failed: ${e.message}. Check backend (${server}).`)
-    }
-  }
+  const recognitionRef = useRef(null)
+  const finalTranscriptRef = useRef('')
+  const startedAtRef = useRef(null)
 
-  async function refreshTasks() {
-    try {
-      const res = await fetch(`${server}/api/tasks/list`)
-      if (!res.ok) return
-      const data = await res.json()
-      setTasks(data?.tasks || [])
-    } catch {}
-  }
-  useEffect(()=>{ refreshTasks() }, [server])
+  const analysis = useMemo(() => analyzeTranscript(currentTranscript), [currentTranscript])
 
-  // --- indexing ---
-  async function doIndex() {
-    setLoading(true); setLog('')
-    try {
-      const r = await call('/api/index', { corpus, index: indexPath, chunk, overlap })
-      setLog(`Indexed ${r.indexedChunks} chunks from ${r.files} files in ${r.elapsedMs} ms`)
-    } catch (e) { setLog(String(e)) }
-    finally { setLoading(false) }
-  }
-
-  // --- ask ---
-  async function doAsk() {
-    setLoading(true); setAnswer(''); setHits([]); setLog('')
-    try {
-      const r = await call('/api/ask', { index: indexPath, q: question, k, model, show: showSnippets })
-      setAnswer(r.answer); setHits(r.hits || []); if (r.debug) setLog(r.debug)
-    } catch (e) { setLog(String(e)) }
-    finally { setLoading(false) }
-  }
-
-  // --- tasks ---
-  function priorityColor(p) { return p==='High' ? 'bg-red-500' : p==='Medium' ? 'bg-amber-500' : 'bg-emerald-500' }
-  async function addTask() {
-    if (!newTitle.trim()) return
-    try {
-      await call('/api/tasks/add', { title: newTitle.trim(), priority: newPriority, due: newDue || null })
-      setNewTitle(''); setNewDue(''); setNewPriority('High')
-      refreshTasks()
-    } catch (e) { setLog(String(e)) }
-  }
-  async function toggleTask(id) { try { await call('/api/tasks/toggle', { id }); refreshTasks() } catch (e){ setLog(String(e)) } }
-  async function delTask(id) { try { await call('/api/tasks/delete', { id }); refreshTasks() } catch (e){ setLog(String(e)) } }
-
-  // --- file upload ---
-  async function onUploadChange(e) {
-    const file = e.target.files?.[0]; if (!file) return
-    setUploading(true); setLog('')
-    const form = new FormData()
-    form.append('file', file)
-    form.append('target', corpus)
-    try {
-      const res = await fetch(`${server}/api/upload`, { method: 'POST', body: form })
-      if (!res.ok) setLog(`Upload failed: ${await res.text()}`)
-      else setLog(`Uploaded to corpus: ${file.name}`)
-    } catch (e) { setLog(String(e)) }
-    setUploading(false)
-  }
-
-  // --- voice ---
-  async function startRecording() {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-      const rec = new MediaRecorder(stream)
-      chunksRef.current = []
-      rec.ondataavailable = e => chunksRef.current.push(e.data)
-      rec.onstop = async () => {
-        const blob = new Blob(chunksRef.current, { type: 'audio/webm' })
-        await sendForTranscription(blob)
-        stream.getTracks().forEach(t => t.stop())
+  useEffect(() => {
+    const stored = localStorage.getItem(STORAGE_KEY)
+    if (stored) {
+      try {
+        const parsed = JSON.parse(stored)
+        setSessions(parsed)
+        if (parsed.length > 0) {
+          setSelectedId(parsed[0].id)
+        }
+      } catch (error) {
+        console.warn('Failed to load saved sessions', error)
       }
-      rec.start()
-      mediaRecorderRef.current = rec
+    }
+  }, [])
+
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions))
+  }, [sessions])
+
+  useEffect(() => {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition
+    if (!SpeechRecognition) {
+      setSpeechSupported(false)
+      setStatus('Speech recognition is not supported in this browser.')
+      return
+    }
+
+    return () => {
+      if (recognitionRef.current) {
+        recognitionRef.current.abort()
+      }
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!selectedId && sessions.length) {
+      setSelectedId(sessions[0].id)
+    }
+  }, [sessions, selectedId])
+
+  const filteredSessions = useMemo(() => {
+    if (!search.trim()) return sessions
+    const term = search.trim().toLowerCase()
+    return sessions.filter((session) => {
+      return [
+        session.title,
+        session.summary,
+        session.transcript,
+        session.tags.join(' '),
+        session.entities.join(' '),
+      ]
+        .filter(Boolean)
+        .some((field) => field.toLowerCase().includes(term))
+    })
+  }, [sessions, search])
+
+  const selectedSession = filteredSessions.find((session) => session.id === selectedId)
+
+  function startRecording() {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition
+    if (!SpeechRecognition) {
+      setSpeechSupported(false)
+      setStatus('Speech recognition is not available in this browser.')
+      return
+    }
+
+    if (isRecording) return
+
+    const recognition = new SpeechRecognition()
+    recognition.lang = 'en-US'
+    recognition.continuous = true
+    recognition.interimResults = true
+
+    finalTranscriptRef.current = ''
+    startedAtRef.current = Date.now()
+
+    recognition.onresult = (event) => {
+      let interim = ''
+      for (let i = event.resultIndex; i < event.results.length; i += 1) {
+        const result = event.results[i]
+        const transcript = result[0].transcript
+        if (result.isFinal) {
+          finalTranscriptRef.current = `${finalTranscriptRef.current} ${transcript}`.trim()
+        } else {
+          interim = `${interim} ${transcript}`.trim()
+        }
+      }
+      const combined = `${finalTranscriptRef.current} ${interim}`.trim()
+      setCurrentTranscript(combined)
+    }
+
+    recognition.onerror = (event) => {
+      setStatus(event.error === 'not-allowed' ? 'Microphone permission denied.' : `Error: ${event.error}`)
+      setIsRecording(false)
+    }
+
+    recognition.onend = () => {
+      setIsRecording(false)
+      if (startedAtRef.current) {
+        setLastDurationMs(Date.now() - startedAtRef.current)
+      }
+      setStatus('Recording ended.')
+    }
+
+    try {
+      recognition.start()
+      recognitionRef.current = recognition
       setIsRecording(true)
-    } catch (e) {
-      setLog('Microphone permission denied or unsupported browser.')
+      setStatus('Listening… Speak naturally and pause when you are done.')
+    } catch (error) {
+      setStatus(`Unable to start recording: ${error.message}`)
     }
   }
-  function stopRecording(){ mediaRecorderRef.current?.stop(); setIsRecording(false) }
-  async function sendForTranscription(blob) {
-    setLoading(true)
-    try {
-      const form = new FormData()
-      form.append('audio', blob, `note-${Date.now()}.webm`)
-      const res = await fetch(`${server}/api/transcribe`, { method: 'POST', body: form })
-      if (!res.ok) throw new Error(await res.text())
-      const data = await res.json()
-      setQuestion(q => (q ? q + '\n' : '') + data.text)
-      setLog('Transcribed and appended to Ask box.')
-    } catch (e) { setLog(String(e)) }
-    finally { setLoading(false) }
+
+  function stopRecording() {
+    if (recognitionRef.current) {
+      recognitionRef.current.stop()
+      recognitionRef.current = null
+    }
+    setIsRecording(false)
+    if (startedAtRef.current) {
+      setLastDurationMs(Date.now() - startedAtRef.current)
+    }
+    setStatus('Recording stopped. Review the transcript below.')
+  }
+
+  function resetDraft() {
+    setCurrentTranscript('')
+    setNoteTitle('Untitled Session')
+    setLastDurationMs(null)
+    finalTranscriptRef.current = ''
+    setStatus('Draft cleared. Ready for a new capture.')
+  }
+
+  function saveSession() {
+    const transcript = currentTranscript.trim()
+    if (!transcript) {
+      setStatus('Add some content before saving your note.')
+      return
+    }
+
+    const { summary, tasks, tags, entities, wordCount } = analysis
+    const newSession = {
+      id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+      title: noteTitle.trim() || 'Untitled Session',
+      createdAt: new Date().toISOString(),
+      transcript,
+      summary,
+      tasks,
+      tags,
+      entities,
+      wordCount,
+      durationMs: lastDurationMs,
+    }
+
+    setSessions((prev) => [newSession, ...prev])
+    setSelectedId(newSession.id)
+    resetDraft()
+    setStatus('Session saved! Find it in your library on the right.')
+  }
+
+  function deleteSession(id) {
+    setSessions((prev) => prev.filter((session) => session.id !== id))
+    if (selectedId === id) {
+      setSelectedId(null)
+    }
+  }
+
+  function toggleTask(sessionId, taskId) {
+    setSessions((prev) =>
+      prev.map((session) => {
+        if (session.id !== sessionId) return session
+        return {
+          ...session,
+          tasks: session.tasks.map((task) =>
+            task.id === taskId ? { ...task, done: !task.done } : task
+          ),
+        }
+      })
+    )
+  }
+
+  function updateSessionTitle(sessionId, nextTitle) {
+    setSessions((prev) =>
+      prev.map((session) =>
+        session.id === sessionId ? { ...session, title: nextTitle } : session
+      )
+    )
+  }
+
+  function handleExport(session) {
+    const blob = new Blob([JSON.stringify(session, null, 2)], {
+      type: 'application/json',
+    })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `${session.title.replace(/[^a-z0-9_-]+/gi, '_') || 'listener_ai_note'}.json`
+    link.click()
+    URL.revokeObjectURL(url)
+  }
+
+  function handleImportText(event) {
+    const file = event.target.files?.[0]
+    if (!file) return
+    const reader = new FileReader()
+    reader.onload = () => {
+      const text = String(reader.result || '')
+      setCurrentTranscript((prev) => (prev ? `${prev}\n\n${text}` : text))
+      setStatus(`Imported ${file.name}`)
+    }
+    reader.readAsText(file)
+    event.target.value = ''
+  }
+
+  function formatDate(isoString) {
+    const date = new Date(isoString)
+    return date.toLocaleString()
   }
 
   return (
-    <div className="min-h-screen p-6 bg-gray-50 text-gray-900">
-      <div className="max-w-6xl mx-auto grid gap-6">
-        <header className="flex items-center justify-between">
-          <h1 className="text-2xl font-bold">BubbleAlert — Developer Assist (UI)</h1>
-          <div className="flex items-center gap-2 text-sm">
-            <span className="opacity-70">Backend:</span>
-            <input className="px-2 py-1 rounded border" value={server} onChange={e=>setServer(e.target.value)} />
-          </div>
-        </header>
+    <div className="app">
+      <header className="app-header">
+        <div>
+          <h1>Listener AI</h1>
+          <p>Your private companion for capturing conversations, structuring notes, and extracting follow-ups.</p>
+        </div>
+        <div className="status-area">
+          <span className={`status-dot ${isRecording ? 'recording' : ''}`} />
+          <span>{status}</span>
+        </div>
+      </header>
 
-        {/* Tasks Panel */}
-        <section className="grid gap-4 p-4 bg-white rounded-2xl shadow">
-          <h2 className="font-semibold">Daily / Pending Tasks</h2>
-          <div className="grid md:grid-cols-3 gap-3">
-            <LabeledInput label="Task" value={newTitle} onChange={setNewTitle} placeholder="e.g., Fix login bug" />
-            <label className="grid gap-1 text-sm">
-              <span className="opacity-70">Priority</span>
-              <select className="px-3 py-2 rounded-xl border" value={newPriority} onChange={e=>setNewPriority(e.target.value)}>
-                <option>High</option><option>Medium</option><option>Low</option>
-              </select>
+      <main className="layout">
+        <section className="column">
+          <div className="panel">
+            <h2 className="section-title">Record or Import</h2>
+            {!speechSupported && (
+              <div className="warning">
+                Speech recognition is unavailable in this browser. Paste or import text instead.
+              </div>
+            )}
+            <label className="field">
+              <span>Session title</span>
+              <input
+                type="text"
+                value={noteTitle}
+                onChange={(event) => setNoteTitle(event.target.value)}
+                placeholder="Brainstorm with the product team"
+              />
             </label>
-            <LabeledInput label="Due (YYYY-MM-DD)" value={newDue} onChange={setNewDue} placeholder="2025-10-15" />
+
+            <div className="button-row">
+              <button
+                type="button"
+                className={`button primary ${isRecording ? 'danger' : ''}`}
+                onClick={isRecording ? stopRecording : startRecording}
+              >
+                {isRecording ? 'Stop Recording' : 'Start Recording'}
+              </button>
+              <label className="button secondary file-input">
+                Import text
+                <input type="file" accept="text/plain" onChange={handleImportText} />
+              </label>
+              <button type="button" className="button" onClick={resetDraft}>
+                Clear draft
+              </button>
+            </div>
+
+            <label className="field">
+              <span>Live transcript</span>
+              <textarea
+                value={currentTranscript}
+                onChange={(event) => setCurrentTranscript(event.target.value)}
+                placeholder="Speak or paste your meeting notes here…"
+                rows={12}
+              />
+            </label>
+
+            <div className="meta">
+              <div>
+                <strong>Words:</strong> {analysis.wordCount}
+              </div>
+              <div>
+                <strong>Duration:</strong> {formatDuration(lastDurationMs)}
+              </div>
+            </div>
+
+            <button type="button" className="button primary full" onClick={saveSession}>
+              Save session
+            </button>
           </div>
-          <div className="flex gap-3">
-            <button onClick={addTask} className="px-4 py-2 rounded-xl bg-black text-white">Add Task</button>
-          </div>
-          <ul className="grid gap-3 mt-3">
-            {tasks.map(t => (
-              <li key={t.id} className="flex items-center justify-between p-3 rounded-2xl border bg-gray-50">
-                <div className="flex items-center gap-3">
-                  <span className={`inline-block w-3 h-3 rounded-full ${priorityColor(t.priority)}`}></span>
-                  <span className={`font-medium ${t.done? 'line-through opacity-60':''}`}>{t.title}</span>
-                  {t.due && <span className="text-xs opacity-70">(due {t.due})</span>}
+
+          <div className="panel">
+            <h2 className="section-title">Instant insights</h2>
+            {analysis.summary ? (
+              <>
+                <div className="summary">
+                  <h3>Summary</h3>
+                  <p>{analysis.summary}</p>
                 </div>
-                <div className="flex items-center gap-2 text-sm">
-                  <button onClick={()=>toggleTask(t.id)} className="px-3 py-1 rounded-xl border">{t.done? 'Mark Pending':'Mark Done'}</button>
-                  <button onClick={()=>delTask(t.id)} className="px-3 py-1 rounded-xl border">Delete</button>
-                </div>
-              </li>
-            ))}
-          </ul>
-        </section>
-
-        {/* Corpus / Index Controls */}
-        <section className="grid gap-4 p-4 bg-white rounded-2xl shadow">
-          <h2 className="font-semibold">Corpus & Index</h2>
-          <div className="grid md:grid-cols-2 gap-3">
-            <LabeledInput label="Corpus folder" value={corpus} onChange={setCorpus} />
-            <LabeledInput label="Index folder" value={indexPath} onChange={setIndexPath} />
-            <LabeledInput label="Chunk size" value={String(chunk)} onChange={v=>setChunk(parseInt(v||'0')||0)} />
-            <LabeledInput label="Overlap" value={String(overlap)} onChange={v=>setOverlap(parseInt(v||'0')||0)} />
-          </div>
-          <div className="flex items-center gap-3">
-            <button onClick={doIndex} disabled={loading} className="px-4 py-2 rounded-xl bg-black text-white">{loading? 'Indexing…':'Build / Rebuild Index'}</button>
-            <label className="text-sm flex items-center gap-2">
-              <input type="file" onChange={onUploadChange} disabled={uploading} />
-              <span>Upload to corpus</span>
-            </label>
-          </div>
-        </section>
-
-        {/* Ask + Voice */}
-        <section className="grid gap-4 p-4 bg-white rounded-2xl shadow">
-          <h2 className="font-semibold">Ask with Context</h2>
-          <LabeledInput label="Question" value={question} onChange={setQuestion} />
-          <div className="grid md:grid-cols-3 gap-3">
-            <LabeledInput label="Top-K" value={String(k)} onChange={v=>setK(parseInt(v||'0')||0)} />
-            <LabeledInput label="Model" value={model} onChange={setModel} />
-            <label className="flex items-center gap-2 text-sm">
-              <input type="checkbox" checked={showSnippets} onChange={(e)=>setShowSnippets(e.target.checked)} />
-              Show retrieved snippets
-            </label>
-          </div>
-          <div className="flex gap-3">
-            <button onClick={doAsk} disabled={loading} className="px-4 py-2 rounded-xl bg-black text-white">{loading? 'Thinking…':'Ask'}</button>
-            {!isRecording ? (
-              <button onClick={startRecording} className="px-4 py-2 rounded-xl border">🎙️ Start Recording</button>
+                {analysis.tasks.length > 0 && (
+                  <div className="tasks-preview">
+                    <h3>Suggested action items</h3>
+                    <ul>
+                      {analysis.tasks.map((task) => (
+                        <li key={task.id}>{task.text}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {analysis.tags.length > 0 && (
+                  <div className="tags">
+                    <h3>Keywords</h3>
+                    <div className="tag-row">
+                      {analysis.tags.map((tag) => (
+                        <span key={tag} className="badge">
+                          #{tag}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </>
             ) : (
-              <button onClick={stopRecording} className="px-4 py-2 rounded-xl border">⏹ Stop</button>
+              <p className="empty-state">
+                Start speaking or paste content to see automatic summaries, action items, and keywords.
+              </p>
             )}
           </div>
-
-          {answer && (
-            <div className="grid gap-2">
-              <h3 className="font-semibold">Answer</h3>
-              <pre className="whitespace-pre-wrap text-sm leading-6">{answer}</pre>
-            </div>
-          )}
         </section>
 
-        {hits.length>0 && (
-          <section className="grid gap-3 p-4 bg-white rounded-2xl shadow">
-            <h2 className="font-semibold">Citations / Hits</h2>
-            <ul className="grid gap-2 text-sm">
-              {hits.map((h, i)=> (
-                <li key={i} className="p-2 rounded-xl bg-gray-50 border">
-                  <div className="font-medium">[{h.source_id}] {h.title} {h.loc ?? ''}</div>
-                  {showSnippets && <div className="mt-1 text-gray-700">{truncate(h.snippet, 900)}</div>}
-                </li>
-              ))}
-            </ul>
-          </section>
-        )}
+        <section className="column">
+          <div className="panel">
+            <h2 className="section-title">Library</h2>
+            <label className="field">
+              <span>Search notes</span>
+              <input
+                type="search"
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+                placeholder='Try "marketing strategy" or "follow up"'
+              />
+            </label>
+            <div className="session-list">
+              {filteredSessions.length === 0 ? (
+                <p className="empty-state">No sessions yet. Save one to get started.</p>
+              ) : (
+                filteredSessions.map((session) => (
+                  <button
+                    type="button"
+                    key={session.id}
+                    className={`session-card ${session.id === selectedId ? 'active' : ''}`}
+                    onClick={() => setSelectedId(session.id)}
+                  >
+                    <div className="session-card-header">
+                      <h3>{session.title}</h3>
+                      <time>{formatDate(session.createdAt)}</time>
+                    </div>
+                    <p className="session-preview">{session.summary || session.transcript.slice(0, 140)}…</p>
+                    <div className="session-tags">
+                      {session.tags.map((tag) => (
+                        <span key={tag} className="badge">
+                          #{tag}
+                        </span>
+                      ))}
+                    </div>
+                  </button>
+                ))
+              )}
+            </div>
+          </div>
 
-        {log && (
-          <section className="grid gap-2 p-4 bg-white rounded-2xl shadow">
-            <h2 className="font-semibold">Log</h2>
-            <pre className="whitespace-pre-wrap text-xs text-gray-700">{log}</pre>
-          </section>
-        )}
+          <div className="panel">
+            {selectedSession ? (
+              <div className="session-detail">
+                <div className="session-detail-header">
+                  <input
+                    type="text"
+                    value={selectedSession.title}
+                    onChange={(event) => updateSessionTitle(selectedSession.id, event.target.value)}
+                  />
+                  <div className="detail-actions">
+                    <button type="button" className="button" onClick={() => handleExport(selectedSession)}>
+                      Export JSON
+                    </button>
+                    <button
+                      type="button"
+                      className="button danger"
+                      onClick={() => deleteSession(selectedSession.id)}
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </div>
 
-        <footer className="text-xs opacity-60 text-center">BubbleAlert — {new Date().toLocaleString()}</footer>
-      </div>
+                <div className="detail-meta">
+                  <span>Created: {formatDate(selectedSession.createdAt)}</span>
+                  <span>Words: {selectedSession.wordCount}</span>
+                  <span>Duration: {formatDuration(selectedSession.durationMs)}</span>
+                  {selectedSession.entities.length > 0 && (
+                    <span>Entities: {selectedSession.entities.join(', ')}</span>
+                  )}
+                </div>
+
+                {selectedSession.summary && (
+                  <div className="detail-section">
+                    <h3>Summary</h3>
+                    <p>{selectedSession.summary}</p>
+                  </div>
+                )}
+
+                {selectedSession.tasks.length > 0 && (
+                  <div className="detail-section">
+                    <h3>Action items</h3>
+                    <ul className="task-list">
+                      {selectedSession.tasks.map((task) => (
+                        <li key={task.id}>
+                          <label>
+                            <input
+                              type="checkbox"
+                              checked={task.done}
+                              onChange={() => toggleTask(selectedSession.id, task.id)}
+                            />
+                            <span className={task.done ? 'done' : ''}>{task.text}</span>
+                          </label>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                <div className="detail-section">
+                  <h3>Transcript</h3>
+                  <pre>{selectedSession.transcript}</pre>
+                </div>
+              </div>
+            ) : (
+              <p className="empty-state">Select a session to review its insights and transcript.</p>
+            )}
+          </div>
+        </section>
+      </main>
     </div>
   )
 }
 
-function LabeledInput({ label, value, onChange, placeholder }) {
-  return (
-    <label className="grid gap-1 text-sm">
-      <span className="opacity-70">{label}</span>
-      <input className="px-3 py-2 rounded-xl border outline-none focus:ring w-full" value={value} onChange={(e)=>onChange(e.target.value)} placeholder={placeholder} />
-    </label>
-  )
-}
-function truncate(s, n){ return (s?.length>n) ? s.slice(0, n) + '…' : s }
+export default App
